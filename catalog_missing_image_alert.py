@@ -44,7 +44,7 @@ MISSING_IMAGE_REPORT_TOKEN = os.environ["MISSING_IMAGE_REPORT_TOKEN"]  # Query 1
 BSKU_URLS_REPORT_TOKEN = os.environ["BSKU_URLS_REPORT_TOKEN"]          # Query 2
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SLACK_CHANNEL = "nv-catalog-missingimage-alert"
+SLACK_CHANNEL = "C0AUXV98TD1"  # #nv-catalog-missingimage-alert
 
 # Merchant display names (ordered — appears in this order in the Slack message)
 MERCHANT_NAMES = {
