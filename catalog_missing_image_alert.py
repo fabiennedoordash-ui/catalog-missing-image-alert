@@ -148,8 +148,11 @@ def main():
             bsku.sort_values("updated_at")
                 .drop_duplicates(subset=["business_id", "msid"], keep="last")
         )
-    # only items with a real URL
-    bsku = bsku[bsku["image_url"].notna() & (bsku["image_url"].str.strip() != "")]
+    # only items with a real URL (filter out NaN, empty, and placeholder strings)
+    bsku = bsku[bsku["image_url"].notna()]
+    bsku["image_url"] = bsku["image_url"].str.strip()
+    bsku = bsku[bsku["image_url"] != ""]
+    bsku = bsku[bsku["image_url"].str.startswith(("http://", "https://"))]
 
     # --- 3) Inner join — missing-image MSIDs that have a URL in BSKU ---
     matched = missing.merge(
