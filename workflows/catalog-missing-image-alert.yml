@@ -1,0 +1,36 @@
+name: NV Catalog Missing Image Alert
+
+on:
+  schedule:
+    # 1 PM EDT (17:00 UTC) — 12 PM EST when DST is off.
+    # Pick one: if you want true 1PM EST year-round, change to '0 18 * * *'
+    # and accept that it runs at 2PM EDT in summer.
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+
+jobs:
+  missing-image-alert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas requests slack_sdk
+
+      - name: Run missing-image alert
+        env:
+          MODE_TOKEN:                 ${{ secrets.MODE_TOKEN }}
+          MODE_SECRET:                ${{ secrets.MODE_SECRET }}
+          MISSING_IMAGE_REPORT_TOKEN: ${{ secrets.MISSING_IMAGE_REPORT_TOKEN }}
+          BSKU_URLS_REPORT_TOKEN:     ${{ secrets.BSKU_URLS_REPORT_TOKEN }}
+          SLACK_BOT_TOKEN:            ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          python catalog_missing_image_alert.py
