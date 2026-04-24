@@ -2,22 +2,14 @@
 """
 NV Catalog Missing-Image Alert
 
-Runs daily at 1 PM EST.
+Runs daily at ~1 PM EST.
 
 Flow:
-1. Pulls MSIDs currently missing images from merchant_catalog via Mode (Snowflake).
-2. Pulls BSKU items that have image URLs for the same business_ids via Mode (Trino).
+1. Pulls MSIDs currently missing images across all NV US merchants
+   (excl. Restaurant & Drive) from merchant_catalog via Mode (Snowflake).
+2. Pulls BSKU items that have image URLs for the same set via Mode (Trino).
 3. Joins to find which missing-image MSIDs have a URL available in BSKU.
-4. Posts a summary + two CSVs to #nv-catalog-missingimage-alert:
-     - missing_image_urls.csv  (input for fetch_photo_metadata bulk tool)
-     - photo_id_template.csv   (template for update_product_item bulk tool)
-
-Env vars required:
-    MODE_TOKEN
-    MODE_SECRET
-    MISSING_IMAGE_REPORT_TOKEN   (Mode report token for Query 1 — Snowflake)
-    BSKU_URLS_REPORT_TOKEN       (Mode report token for Query 2 — Trino)
-    SLACK_BOT_TOKEN
+4. Posts a summary + two CSVs to #nv-catalog-missingimage-alert.
 """
 
 import os
@@ -40,17 +32,15 @@ MODE_TOKEN = os.environ["MODE_TOKEN"]
 MODE_SECRET = os.environ["MODE_SECRET"]
 AUTH = (MODE_TOKEN, MODE_SECRET)
 
-MISSING_IMAGE_REPORT_TOKEN = os.environ["MISSING_IMAGE_REPORT_TOKEN"]  # Query 1
-BSKU_URLS_REPORT_TOKEN = os.environ["BSKU_URLS_REPORT_TOKEN"]          # Query 2
+MISSING_IMAGE_REPORT_TOKEN = os.environ["MISSING_IMAGE_REPORT_TOKEN"]
+BSKU_URLS_REPORT_TOKEN = os.environ["BSKU_URLS_REPORT_TOKEN"]
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL = "C0AUXV98TD1"  # #nv-catalog-missingimage-alert
 
-# Merchant display names (ordered — appears in this order in the Slack message)
-MERCHANT_NAMES = {
-    "799015":   "Dollar General",
-    "13434351": "Family Dollar",
-}
+# How many merchants to show individually in the Slack breakdown before
+# rolling the rest up into "+ N other merchants"
+TOP_N_MERCHANTS = 15
 
 BULK_TOOL_1_URL = "https://unity.doordash.com/suites/bulk/bulk_tools/categories/retail_catalog/fetch_photo_metadata"
 BULK_TOOL_2_URL = "https://unity.doordash.com/suites/bulk/bulk_tools/categories/retail_catalog/update_product_item"
@@ -110,7 +100,6 @@ def run_mode_report(report_token: str, label: str) -> pd.DataFrame:
 # ============================= SLACK ==============================
 
 def post_slack_alert(message: str, files: list) -> None:
-    """files: list of (local_path, slack_filename, title) tuples"""
     client = WebClient(token=SLACK_BOT_TOKEN)
     file_uploads = [
         {"file": path, "filename": fn, "title": title}
@@ -142,19 +131,19 @@ def main():
     bsku["business_id"] = bsku["business_id"].astype(str)
     bsku["msid"] = bsku["msid"].astype(str)
 
-    # keep latest row per (biz, msid)
     if "updated_at" in bsku.columns:
         bsku = (
             bsku.sort_values("updated_at")
                 .drop_duplicates(subset=["business_id", "msid"], keep="last")
         )
-    # only items with a real URL (filter out NaN, empty, and placeholder strings)
+
+    # Filter out NaN, empty, and non-http placeholder values
     bsku = bsku[bsku["image_url"].notna()]
     bsku["image_url"] = bsku["image_url"].str.strip()
     bsku = bsku[bsku["image_url"] != ""]
     bsku = bsku[bsku["image_url"].str.startswith(("http://", "https://"))]
 
-    # --- 3) Inner join — missing-image MSIDs that have a URL in BSKU ---
+    # --- 3) Inner join ---
     matched = missing.merge(
         bsku[["business_id", "msid", "image_url"]],
         on=["business_id", "msid"],
@@ -175,20 +164,28 @@ def main():
         "source": "MX",
     })
 
-    # --- 5) CSV 2: update_product_item template (photoID blank) ---
+    # --- 5) CSV 2: update_product_item template ---
     csv2 = pd.DataFrame({
         "businessId": matched["business_id"],
         "itemMerchantSuppliedId": matched["msid"],
         "photoID": "",
     })
 
-    # --- 6) Per-merchant breakdown ---
-    counts_matched = matched.groupby("business_id").size().to_dict()
-    counts_missing = missing.groupby("business_id").size().to_dict()
+    # --- 6) Per-merchant breakdown (dynamic from business_name) ---
+    name_lookup = (
+        missing[["business_id", "business_name"]]
+        .dropna(subset=["business_name"])
+        .drop_duplicates(subset=["business_id"])
+        .set_index("business_id")["business_name"]
+        .to_dict()
+    )
+
+    counts_matched = matched.groupby("business_id").size().sort_values(ascending=False)
+    counts_missing = missing.groupby("business_id").size()
 
     today = datetime.now(ZoneInfo("America/New_York")).strftime("%b %d, %Y")
     total_matched = len(matched)
-    total_merchants = sum(1 for b in MERCHANT_NAMES if counts_matched.get(b, 0) > 0)
+    total_merchants = (counts_matched > 0).sum()
 
     lines = [
         f"*🖼️ Missing Image Catalog Update — {today}*",
@@ -200,16 +197,26 @@ def main():
             f"Please run the bulk flow below to get these images live ASAP."
         ),
         "",
-        "*Mx Breakdown:*",
+        f"*Top {min(TOP_N_MERCHANTS, total_merchants)} Mx by Volume:*",
     ]
-    for biz_id, display_name in MERCHANT_NAMES.items():
-        matched_n = counts_matched.get(biz_id, 0)
+
+    top_merchants = counts_matched.head(TOP_N_MERCHANTS)
+    for biz_id, matched_n in top_merchants.items():
+        name = name_lookup.get(biz_id, f"Biz {biz_id}")
         missing_n = counts_missing.get(biz_id, 0)
         pct = (matched_n / missing_n * 100) if missing_n else 0
         lines.append(
-            f"• *{display_name}* ({biz_id}) — *{matched_n:,} MSIDs* "
+            f"• *{name}* ({biz_id}) — *{matched_n:,} MSIDs* "
             f"({pct:.1f}% of this Mx's missing-image MSIDs) found in BSKU"
         )
+
+    remaining = counts_matched.iloc[TOP_N_MERCHANTS:]
+    if len(remaining) > 0:
+        lines.append(
+            f"• _+ {len(remaining)} other merchants ({remaining.sum():,} MSIDs) — "
+            f"see attached CSV for the full list_"
+        )
+
     lines += [
         "",
         "*Upload Steps:*",
