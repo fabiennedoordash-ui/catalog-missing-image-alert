@@ -32,11 +32,10 @@ MODE_TOKEN = os.environ["MODE_TOKEN"]
 MODE_SECRET = os.environ["MODE_SECRET"]
 AUTH = (MODE_TOKEN, MODE_SECRET)
 
-# NOTE: Migrated from two queries (MISSING_IMAGE_REPORT_TOKEN + BSKU_URLS_REPORT_TOKEN)
-# to a single merged Trino query. Update your GitHub secret accordingly:
-#   - Add new secret: MATCHED_REPORT_TOKEN  → token of merged Trino report
-#   - Old MISSING_IMAGE_REPORT_TOKEN and BSKU_URLS_REPORT_TOKEN can be removed
-MATCHED_REPORT_TOKEN = os.environ["MATCHED_REPORT_TOKEN"]
+# NOTE: Migrated from two queries to a single merged Trino query.
+# The BSKU_URLS_REPORT_TOKEN secret now points to the merged report.
+# The old MISSING_IMAGE_REPORT_TOKEN secret is no longer used and can be deleted.
+MATCHED_REPORT_TOKEN = os.environ["BSKU_URLS_REPORT_TOKEN"]
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL = "C0AUXV98TD1"  # #nv-catalog-missingimage-alert
