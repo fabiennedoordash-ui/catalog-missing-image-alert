@@ -167,26 +167,80 @@ def apply_pattern_filter(df: pd.DataFrame, url_col: str = "image_url") -> pd.Dat
     return df[~bad_mask].copy()
 
 
-def _probe_one_url(url: str) -> int:
-    """Return HTTP status code (or 0 on connection failure)."""
+# Known placeholder strings/bytes returned by retailer image servers when the
+# requested SKU image doesn't exist. These come back as HTTP 200 (so HEAD probe
+# alone can't catch them). We download the first ~4KB of each URL and check the
+# response body for these patterns.
+PLACEHOLDER_RESPONSE_PATTERNS = [
+    b"unable to find image",   # Albertsons (images.albertsons-media.com)
+    b"image not found",
+    b"no image available",
+    b"image unavailable",
+    b"<code>accessdenied",     # AWS S3 (e.g. cdn.localexpress.io)
+    b'"status":404',           # JSON-formatted 404 (e.g. gmfgcdn.azureedge.net)
+]
+
+# Hosts that return placeholder PAGES (HTML) instead of images when the SKU
+# isn't found — content-type starting with text/* on these hosts is a strong
+# signal it's a placeholder.
+PLACEHOLDER_HTML_HOSTS = {
+    "images.albertsons-media.com",
+}
+
+
+def _probe_one_url(url: str) -> tuple:
+    """Return (status_code, is_placeholder).
+
+    Performs a ranged GET for the first 4KB so we can:
+      1. Confirm the URL is reachable (status code)
+      2. Inspect the response body for placeholder patterns
+      3. Check content-type — if it's text/* on an image host, that's
+         a placeholder response
+
+    Returns (0, False) on connection failure.
+    """
     try:
-        r = requests.head(url, timeout=HEAD_PROBE_TIMEOUT, allow_redirects=True)
-        # Some servers don't allow HEAD — fall back to a 1-byte ranged GET
-        if r.status_code in (405, 501):
-            r = requests.get(
-                url,
-                timeout=HEAD_PROBE_TIMEOUT,
-                stream=True,
-                headers={"Range": "bytes=0-0"},
-            )
+        # Ranged GET: 4KB is enough to either contain a placeholder text
+        # response or the header bytes of a real image
+        r = requests.get(
+            url,
+            timeout=HEAD_PROBE_TIMEOUT,
+            stream=True,
+            headers={"Range": "bytes=0-4095"},
+            allow_redirects=True,
+        )
+        status = r.status_code
+        if not (200 <= status < 300):
             r.close()
-        return r.status_code
+            return (status, False)
+
+        ct = (r.headers.get("content-type") or "").lower()
+        body = r.raw.read(4096) if r.raw else b""
+        r.close()
+
+        # Heuristic 1: text/* on a known image host = placeholder
+        try:
+            host = url.split("/")[2].lower()
+        except IndexError:
+            host = ""
+        if host in PLACEHOLDER_HTML_HOSTS and ct.startswith("text/"):
+            return (status, True)
+
+        # Heuristic 2: response body contains known placeholder string
+        body_lower = body.lower()
+        for pat in PLACEHOLDER_RESPONSE_PATTERNS:
+            if pat in body_lower:
+                return (status, True)
+
+        return (status, False)
     except Exception:
-        return 0  # DNS failure, timeout, connection refused, etc.
+        return (0, False)  # DNS failure, timeout, etc.
 
 
 def apply_head_probe(df: pd.DataFrame, url_col: str = "image_url") -> pd.DataFrame:
-    """Probe each URL with a HEAD request; keep only rows where status is 2xx.
+    """Probe each URL with a ranged GET; keep only rows where:
+      - status is 2xx, AND
+      - response body doesn't match a known placeholder pattern.
 
     Skipped if df has more than HEAD_PROBE_MAX_ROWS rows (saves runtime on backfills).
     """
@@ -198,22 +252,31 @@ def apply_head_probe(df: pd.DataFrame, url_col: str = "image_url") -> pd.DataFra
               f"{HEAD_PROBE_MAX_ROWS:,}. Using pattern filter only.")
         return df
 
-    print(f"   HEAD-probing {n:,} URLs with {HEAD_PROBE_CONCURRENCY} concurrent workers...")
+    print(f"   Probing {n:,} URLs with {HEAD_PROBE_CONCURRENCY} concurrent workers "
+          f"(checking status + placeholder content)...")
     start = time.time()
 
     urls = df[url_col].tolist()
     with concurrent.futures.ThreadPoolExecutor(max_workers=HEAD_PROBE_CONCURRENCY) as ex:
-        statuses = list(ex.map(_probe_one_url, urls))
+        results = list(ex.map(_probe_one_url, urls))
+
+    statuses = [r[0] for r in results]
+    is_placeholder = [r[1] for r in results]
 
     df = df.copy()
     df["_http_status"] = statuses
+    df["_is_placeholder"] = is_placeholder
 
-    alive_mask = df["_http_status"].between(200, 299)
-    alive = df[alive_mask].drop(columns=["_http_status"])
-    dead = (~alive_mask).sum()
+    status_ok = df["_http_status"].between(200, 299)
+    not_placeholder = ~df["_is_placeholder"]
+    alive_mask = status_ok & not_placeholder
+
+    alive = df[alive_mask].drop(columns=["_http_status", "_is_placeholder"])
+    dead_status = (~status_ok).sum()
+    dead_placeholder = (status_ok & ~not_placeholder).sum()
     elapsed = time.time() - start
-    print(f"   HEAD probe done in {elapsed:.0f}s — kept {len(alive):,}, "
-          f"dropped {dead:,} ({dead / n * 100:.1f}%)")
+    print(f"   Probe done in {elapsed:.0f}s — kept {len(alive):,}, "
+          f"dropped {dead_status:,} (bad status) + {dead_placeholder:,} (placeholder)")
     return alive
 
 
