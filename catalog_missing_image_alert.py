@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
 NV Catalog Missing-Image Alert
+
 Runs daily at ~1 PM EST.
 
 Flow:
-1. Pulls matched MSIDs (missing image in catalog + URL available in BSKU)
-   from a single merged Trino Mode report.
-2. Filters out URLs that match known placeholder/broken patterns.
-3. Posts a summary + three CSVs to #nv-catalog-missingimage-alert:
-     - missing_image_urls.csv     (Bulk Tool 1 input — usable URLs only)
-     - photo_id_template.csv      (Bulk Tool 2 template — usable URLs only)
-     - broken_image_urls.csv      (rejected URLs, for tracking only)
+1. Pulls MSIDs currently missing images across all NV US merchants
+   (excl. Restaurant & Drive) from merchant_catalog via Mode (Snowflake).
+2. Pulls BSKU items that have image URLs for the same set via Mode (Trino).
+3. Joins to find which missing-image MSIDs have a URL available in BSKU.
+4. Filters out broken/placeholder URLs:
+     a. Pattern filter: drops known placeholder patterns (DD_PLACEHOLDER, ItemDefault,
+        coming-soon, etc.) and Modisoft hash URLs that 404 reliably.
+     b. HEAD probe: hits each remaining URL with a HEAD request to confirm it's
+        actually live (200 OK). Skipped automatically when row count is high
+        (one-time backfills) to keep runtime sane.
+5. Posts a summary + two CSVs to #nv-catalog-missingimage-alert.
 """
+
 import os
-import re
 import sys
 import time
 import tempfile
+import concurrent.futures
 from datetime import datetime
 from io import StringIO
 from zoneinfo import ZoneInfo
@@ -27,30 +33,72 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 # ============================= CONFIG =============================
+
 MODE_WORKSPACE = "doordash"
 MODE_TOKEN = os.environ["MODE_TOKEN"]
 MODE_SECRET = os.environ["MODE_SECRET"]
 AUTH = (MODE_TOKEN, MODE_SECRET)
 
-# NOTE: Migrated from two queries to a single merged Trino query.
-# The BSKU_URLS_REPORT_TOKEN secret now points to the merged report.
-# The old MISSING_IMAGE_REPORT_TOKEN secret is no longer used and can be deleted.
-MATCHED_REPORT_TOKEN = os.environ["BSKU_URLS_REPORT_TOKEN"]
+MISSING_IMAGE_REPORT_TOKEN = os.environ["MISSING_IMAGE_REPORT_TOKEN"]
+BSKU_URLS_REPORT_TOKEN = os.environ["BSKU_URLS_REPORT_TOKEN"]
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL = "C0AUXV98TD1"  # #nv-catalog-missingimage-alert
 
+# Slack user to tag as the action owner (will be @-mentioned at the top of msg)
+SLACK_ACTION_OWNER_ID = "U0AR5NG6JRF"
+
+# Slack users to cc at the bottom of the message
+SLACK_CC_USER_IDS = ["U049N4SU51A", "U02ET47GB16", "U02NGA5G1GV"]
+
+# How many merchants to show individually in the Slack breakdown before
+# rolling the rest up into "+ N other merchants"
 TOP_N_MERCHANTS = 15
 
 BULK_TOOL_1_URL = "https://unity.doordash.com/suites/bulk/bulk_tools/categories/retail_catalog/fetch_photo_metadata"
 BULK_TOOL_2_URL = "https://unity.doordash.com/suites/bulk/bulk_tools/categories/retail_catalog/update_product_item"
 
+# ---------- URL FILTER CONFIG ----------
+# If matched-row count exceeds this, the HEAD-probe step is SKIPPED and only the
+# pattern filter runs. Probing 1M+ URLs would take hours; for backfills we accept
+# that some links will fail in the bulk tool itself.
+HEAD_PROBE_MAX_ROWS = 300_000
+
+# Number of concurrent HEAD requests
+HEAD_PROBE_CONCURRENCY = 50
+
+# Per-request timeout in seconds for HEAD probe
+HEAD_PROBE_TIMEOUT = 8
+
+# Substring patterns (case-insensitive) that mark a URL as a known placeholder.
+# Add new ones here when you spot them in bulk-tool failure reports.
+PLACEHOLDER_SUBSTRINGS = [
+    "dd_placeholder",
+    "itemdefault",
+    "coming-soon",
+    "missing-image",
+    "no-image",
+    "noimage",
+    "/placeholder",
+    "comingsoon",
+    "image-not-found",
+]
+
+# Hostname/path fragments for sources known to serve dead links reliably.
+# Modisoft's `/doordash/images/` URLs are extension-less hashes that 404.
+KNOWN_BAD_URL_FRAGMENTS = [
+    "back2.modisoft.com/doordash/images/",
+    "cvs.com/webcontent/images/weeklyad/",
+]
+
 # ============================= MODE API ===========================
+
 def trigger_mode_run(report_token: str) -> str:
     url = f"https://app.mode.com/api/{MODE_WORKSPACE}/reports/{report_token}/runs"
     resp = requests.post(url, auth=AUTH, json={"parameters": {}})
     resp.raise_for_status()
     return resp.json()["token"]
+
 
 def wait_for_run(report_token: str, run_token: str, max_wait_minutes: int = 25) -> None:
     url = f"https://app.mode.com/api/{MODE_WORKSPACE}/reports/{report_token}/runs/{run_token}"
@@ -67,6 +115,7 @@ def wait_for_run(report_token: str, run_token: str, max_wait_minutes: int = 25) 
         time.sleep(20)
     raise TimeoutError(f"Mode run timed out for report {report_token}")
 
+
 def fetch_run_csv(report_token: str, run_token: str) -> pd.DataFrame:
     qruns_url = (
         f"https://app.mode.com/api/{MODE_WORKSPACE}/reports/{report_token}"
@@ -74,6 +123,7 @@ def fetch_run_csv(report_token: str, run_token: str) -> pd.DataFrame:
     )
     qruns = requests.get(qruns_url, auth=AUTH).json()
     qrun_token = qruns["_embedded"]["query_runs"][0]["token"]
+
     csv_url = (
         f"https://app.mode.com/api/{MODE_WORKSPACE}/reports/{report_token}"
         f"/runs/{run_token}/query_runs/{qrun_token}/results/content.csv"
@@ -81,6 +131,7 @@ def fetch_run_csv(report_token: str, run_token: str) -> pd.DataFrame:
     resp = requests.get(csv_url, auth=AUTH)
     resp.raise_for_status()
     return pd.read_csv(StringIO(resp.text), dtype=str)
+
 
 def run_mode_report(report_token: str, label: str) -> pd.DataFrame:
     print(f"\n▶ Running Mode report: {label}")
@@ -91,48 +142,84 @@ def run_mode_report(report_token: str, label: str) -> pd.DataFrame:
     print(f"   → {len(df):,} rows returned")
     return df
 
-# ============================= URL CLEANING ======================
-# Rules derived from manually-labeled sample (~300 rows):
-# 96% recall, 96% precision on the labeled set.
-def is_placeholder_url(url) -> bool:
-    """Return True if URL matches a known placeholder/broken pattern."""
-    if not isinstance(url, str):
-        return True
-    u = url.lower()
 
-    # 1) place-hold.it — text-on-color stub images (100% bad in sample)
-    if "place-hold.it" in u:
-        return True
-    # 2) liquorapps "Uncat_Icon" — generic uncategorized icon
-    if "uncat_icon" in u:
-        return True
-    # 3) liquorapps /wp/bg/ — non-product background images
-    if "liquorapps.com/wp/bg/" in u:
-        return True
-    # 4) Sobeys _PHP_VOILA_ / _GPHP_VOILA_ — placeholder thumbnail variant
-    #    (real Sobeys URLs use plain _VOILA_ instead)
-    if re.search(r"_p?gphp_voila_|_php_voila_", u):
-        return True
-    # 5) Meijer URLs missing the _A1C1_ infix — older/legacy style, usually broken
-    if "meijer.com/content/dam/meijer/product/" in u and "_a1c1_" not in u:
-        return True
-    # 6) localexpress legacy import path
-    if "localexpress.io/original/img/import/" in u:
-        return True
-    # 7) bevz syndigo-images bucket
-    if "bevz-media" in u and "syndigo-images" in u:
-        return True
-    # 8) Generic catch-all kept from prior version
-    if "default_image_url" in u:
-        return True
-    return False
+# ============================= URL FILTERS ========================
 
-def clean_image_urls(df: pd.DataFrame, url_col: str = "image_url"):
-    """Split a DataFrame into (good_df, broken_df) based on URL patterns."""
-    bad_mask = df[url_col].apply(is_placeholder_url)
-    return df.loc[~bad_mask].copy(), df.loc[bad_mask].copy()
+def apply_pattern_filter(df: pd.DataFrame, url_col: str = "image_url") -> pd.DataFrame:
+    """Drop rows whose URL matches a known-broken pattern. Always cheap to run."""
+    before = len(df)
+    url_lower = df[url_col].astype(str).str.lower()
+
+    placeholder_re = "|".join(PLACEHOLDER_SUBSTRINGS)
+    bad_pattern = url_lower.str.contains(placeholder_re, regex=True, na=False)
+
+    bad_fragment = pd.Series(False, index=df.index)
+    for frag in KNOWN_BAD_URL_FRAGMENTS:
+        bad_fragment = bad_fragment | url_lower.str.contains(frag, regex=False, na=False)
+
+    # Also drop URLs containing whitespace, quotes, or angle brackets (corrupt entries)
+    bad_chars = df[url_col].astype(str).str.contains(r"[\s\"'<>]", regex=True, na=False)
+
+    bad_mask = bad_pattern | bad_fragment | bad_chars
+    dropped = bad_mask.sum()
+    if dropped:
+        print(f"   Pattern filter dropped {dropped:,} of {before:,} rows "
+              f"({dropped / before * 100:.1f}%)")
+    return df[~bad_mask].copy()
+
+
+def _probe_one_url(url: str) -> int:
+    """Return HTTP status code (or 0 on connection failure)."""
+    try:
+        r = requests.head(url, timeout=HEAD_PROBE_TIMEOUT, allow_redirects=True)
+        # Some servers don't allow HEAD — fall back to a 1-byte ranged GET
+        if r.status_code in (405, 501):
+            r = requests.get(
+                url,
+                timeout=HEAD_PROBE_TIMEOUT,
+                stream=True,
+                headers={"Range": "bytes=0-0"},
+            )
+            r.close()
+        return r.status_code
+    except Exception:
+        return 0  # DNS failure, timeout, connection refused, etc.
+
+
+def apply_head_probe(df: pd.DataFrame, url_col: str = "image_url") -> pd.DataFrame:
+    """Probe each URL with a HEAD request; keep only rows where status is 2xx.
+
+    Skipped if df has more than HEAD_PROBE_MAX_ROWS rows (saves runtime on backfills).
+    """
+    n = len(df)
+    if n == 0:
+        return df
+    if n > HEAD_PROBE_MAX_ROWS:
+        print(f"   Skipping HEAD probe: {n:,} rows exceeds threshold of "
+              f"{HEAD_PROBE_MAX_ROWS:,}. Using pattern filter only.")
+        return df
+
+    print(f"   HEAD-probing {n:,} URLs with {HEAD_PROBE_CONCURRENCY} concurrent workers...")
+    start = time.time()
+
+    urls = df[url_col].tolist()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=HEAD_PROBE_CONCURRENCY) as ex:
+        statuses = list(ex.map(_probe_one_url, urls))
+
+    df = df.copy()
+    df["_http_status"] = statuses
+
+    alive_mask = df["_http_status"].between(200, 299)
+    alive = df[alive_mask].drop(columns=["_http_status"])
+    dead = (~alive_mask).sum()
+    elapsed = time.time() - start
+    print(f"   HEAD probe done in {elapsed:.0f}s — kept {len(alive):,}, "
+          f"dropped {dead:,} ({dead / n * 100:.1f}%)")
+    return alive
+
 
 # ============================= SLACK ==============================
+
 def post_slack_alert(message: str, files: list) -> None:
     client = WebClient(token=SLACK_BOT_TOKEN)
     file_uploads = [
@@ -149,40 +236,68 @@ def post_slack_alert(message: str, files: list) -> None:
         print(f"❌ Slack API error: {e.response['error']}")
         raise
 
+
 # ============================= MAIN ===============================
+
 def main():
-    # --- 1) Pull merged matched dataset (single Trino query) ---
-    raw = run_mode_report(MATCHED_REPORT_TOKEN, "Matched missing-image MSIDs + BSKU URLs")
-    raw.columns = [c.lower() for c in raw.columns]
+    # --- 1) Pull missing-image MSIDs (Snowflake) ---
+    missing = run_mode_report(MISSING_IMAGE_REPORT_TOKEN, "Query 1 — missing images")
+    missing.columns = [c.lower() for c in missing.columns]
+    missing["business_id"] = missing["business_id"].astype(str)
+    missing["msid"] = missing["msid"].astype(str)
 
-    # Defensive type / shape coercion
-    raw["business_id"] = raw["business_id"].astype(str)
-    raw["msid"] = raw["msid"].astype(str)
-    raw["image_url"] = raw["image_url"].astype(str).str.strip()
+    # --- 2) Pull BSKU items with URLs (Trino) ---
+    bsku = run_mode_report(BSKU_URLS_REPORT_TOKEN, "Query 2 — BSKU URLs")
+    bsku.columns = [c.lower() for c in bsku.columns]
+    bsku["business_id"] = bsku["business_id"].astype(str)
+    bsku["msid"] = bsku["msid"].astype(str)
 
-    # Belt-and-suspenders: keep only http(s) URLs even though the SQL filters this
-    raw = raw[raw["image_url"].str.startswith(("http://", "https://"))]
+    if "updated_at" in bsku.columns:
+        bsku = (
+            bsku.sort_values("updated_at")
+                .drop_duplicates(subset=["business_id", "msid"], keep="last")
+        )
 
-    total_raw = len(raw)
-    print(f"\nTotal matched rows from Mode: {total_raw:,}")
+    # Filter out NaN, empty, and non-http placeholder values (cheap pre-filter)
+    bsku = bsku[bsku["image_url"].notna()]
+    bsku["image_url"] = bsku["image_url"].str.strip()
+    bsku = bsku[bsku["image_url"] != ""]
+    bsku = bsku[bsku["image_url"].str.startswith(("http://", "https://"))]
 
-    if raw.empty:
+    # --- 3) Inner join ---
+    matched = missing.merge(
+        bsku[["business_id", "msid", "image_url"]],
+        on=["business_id", "msid"],
+        how="inner",
+    )
+    print(f"\n✅ Matched {len(matched):,} MSIDs with URLs available in BSKU")
+
+    if matched.empty:
         print("Nothing to alert on — exiting quietly.")
         return
 
-    # --- 2) Split into usable URLs vs broken/placeholder URLs ---
-    matched, broken = clean_image_urls(raw)
-    n_good = len(matched)
-    n_broken = len(broken)
-    pct_broken = (n_broken / total_raw * 100) if total_raw else 0.0
-    print(f"  → {n_good:,} usable URLs ({100 - pct_broken:.1f}%)")
-    print(f"  → {n_broken:,} broken/placeholder URLs filtered out ({pct_broken:.1f}%)")
+    # --- 3.5) Filter out broken URLs ---
+    print("\n▶ Filtering broken URLs")
+    pre_filter_count = len(matched)
+    pre_filter_df = matched.copy()
+    matched = apply_pattern_filter(matched)
+    matched = apply_head_probe(matched)
+    print(f"   → {len(matched):,} clean URLs remaining")
+
+    # Capture dropped rows for attachment
+    kept_keys = set(zip(matched["business_id"], matched["msid"]))
+    dropped_df = pre_filter_df[
+        ~pre_filter_df.apply(
+            lambda r: (r["business_id"], r["msid"]) in kept_keys, axis=1
+        )
+    ]
+    broken_count = len(dropped_df)
 
     if matched.empty:
-        print("All URLs were filtered as broken — exiting quietly.")
+        print("All URLs filtered out — nothing to send.")
         return
 
-    # --- 3) CSV 1: fetch_photo_metadata bulk tool input ---
+    # --- 4) CSV 1: fetch_photo_metadata bulk tool input ---
     csv1 = pd.DataFrame({
         "businessId": matched["business_id"],
         "itemMerchantSuppliedId": matched["msid"],
@@ -191,118 +306,105 @@ def main():
         "source": "MX",
     })
 
-    # --- 4) CSV 2: update_product_item template ---
+    # --- 5) CSV 2: update_product_item template ---
     csv2 = pd.DataFrame({
         "businessId": matched["business_id"],
         "itemMerchantSuppliedId": matched["msid"],
         "photoID": "",
     })
 
-    # --- 5) CSV 3: broken URLs for tracking (NOT for upload) ---
-    broken_cols = [
-        "business_id", "business_name", "msid", "item_name",
-        "brand", "category_l1", "category_l2", "photo_id", "image_url",
-    ]
-    csv3 = broken[[c for c in broken_cols if c in broken.columns]].copy()
-    csv3 = csv3.rename(columns={
-        "business_id": "Business ID",
-        "business_name": "Business Name",
-        "msid": "MSID",
-        "item_name": "Item Name",
-        "brand": "Brand",
-        "category_l1": "Category L1",
-        "category_l2": "Category L2",
-        "photo_id": "Photo ID",
-        "image_url": "Broken Image URL",
-    })
-
-    # --- 6) Per-merchant breakdown ---
-    counts_matched = matched.groupby("business_id").size().sort_values(ascending=False)
-    counts_broken = (
-        broken.groupby("business_id").size()
-        if not broken.empty
-        else pd.Series(dtype=int)
-    )
-
+    # --- 6) Per-merchant breakdown (dynamic from business_name) ---
     name_lookup = (
-        pd.concat([matched, broken])[["business_id", "business_name"]]
+        missing[["business_id", "business_name"]]
         .dropna(subset=["business_name"])
         .drop_duplicates(subset=["business_id"])
         .set_index("business_id")["business_name"]
         .to_dict()
     )
 
+    counts_matched = matched.groupby("business_id").size().sort_values(ascending=False)
+    counts_missing = missing.groupby("business_id").size()
+
     today = datetime.now(ZoneInfo("America/New_York")).strftime("%b %d, %Y")
+    total_matched = len(matched)
     total_merchants = (counts_matched > 0).sum()
 
     lines = [
         f"*🖼️ Missing Image Catalog Update — {today}*",
         "",
         (
-            f"*{n_good:,} MSIDs* across *{total_merchants} merchant"
-            f"{'s' if total_merchants != 1 else ''}* currently have no image live "
-            f"in the catalog but *do* have a usable image URL available in BSKU. "
-            f"Please run the bulk flow below to get these images live ASAP."
+            f"<@{SLACK_ACTION_OWNER_ID}> — *{total_matched:,} MSIDs* across "
+            f"*{total_merchants:,} Mx* have no image live but a usable URL in BSKU "
+            f"was sent in the last 48Hr. Please run the bulk flow to push these live ASAP."
         ),
-        "",
-        (
-            f"*Broken URL filter:* {n_broken:,} of {total_raw:,} matched URLs "
-            f"({pct_broken:.1f}%) were flagged as broken / placeholder images "
-            f"and excluded from the upload — see `broken_image_urls.csv` for the full list."
-        ),
-        "",
-        f"*Top {min(TOP_N_MERCHANTS, total_merchants)} Mx by Volume:*",
     ]
 
-    top = counts_matched.head(TOP_N_MERCHANTS)
-    for biz_id, matched_n in top.items():
+    if broken_count > 0:
+        broken_pct = broken_count / pre_filter_count * 100
+        lines += [
+            "",
+            (
+                f"_Broken URL filter: {broken_count:,} of {pre_filter_count:,} matched URLs "
+                f"({broken_pct:.1f}%) flagged as broken / placeholder and excluded — "
+                f"see `broken_image_urls.csv`._"
+            ),
+        ]
+
+    lines += [
+        "",
+        f"*Top {min(TOP_N_MERCHANTS, total_merchants)} Mx:*",
+    ]
+
+    top_merchants = counts_matched.head(TOP_N_MERCHANTS)
+    for biz_id, matched_n in top_merchants.items():
         name = name_lookup.get(biz_id, f"Biz {biz_id}")
-        broken_n = int(counts_broken.get(biz_id, 0))
-        broken_suffix = f" ({broken_n:,} broken links)" if broken_n else ""
-        lines.append(
-            f"• *{name}* ({biz_id}) — *{matched_n:,} usable MSIDs*{broken_suffix}"
-        )
+        lines.append(f"• *{name}* ({biz_id}) — *{matched_n:,}*")
 
     remaining = counts_matched.iloc[TOP_N_MERCHANTS:]
     if len(remaining) > 0:
         lines.append(
-            f"• _+ {len(remaining)} other merchants ({remaining.sum():,} usable MSIDs) — "
-            f"see attached CSV for the full list_"
+            f"• _+ {len(remaining):,} other Mx ({remaining.sum():,} MSIDs) — see attached CSV_"
         )
 
+    cc_mentions = " ".join(f"<@{uid}>" for uid in SLACK_CC_USER_IDS)
     lines += [
         "",
-        "*Upload Steps:*",
-        f"1. Download `missing_image_urls.csv` (attached) and upload to the fetch_photo_metadata "
-        f"bulk tool: {BULK_TOOL_1_URL}",
-        f"2. Download the photoId output from Step 1, paste the photoIds into "
-        f"`photo_id_template.csv` (attached), and upload to the update_product_item bulk tool: {BULK_TOOL_2_URL}",
-        "3. Confirm the final bulk upload has processed in thread below 🧵",
+        "*Steps:*",
+        f"1. Upload `missing_image_urls.csv` → <{BULK_TOOL_1_URL}|fetch_photo_metadata>",
+        f"2. Paste resulting photoIDs into `photo_id_template.csv` → <{BULK_TOOL_2_URL}|update_product_item>",
+        "3. Confirm in thread 🧵",
+        "",
+        f"cc: {cc_mentions}",
     ]
-
     message = "\n".join(lines)
 
     # --- 7) Write CSVs and post to Slack ---
     with tempfile.TemporaryDirectory() as td:
         p1 = os.path.join(td, "missing_image_urls.csv")
         p2 = os.path.join(td, "photo_id_template.csv")
-        p3 = os.path.join(td, "broken_image_urls.csv")
         csv1.to_csv(p1, index=False)
         csv2.to_csv(p2, index=False)
-        csv3.to_csv(p3, index=False)
 
-        files = [
+        files_to_upload = [
             (p1, "missing_image_urls.csv", "Bulk Tool 1 Input (fetch_photo_metadata)"),
             (p2, "photo_id_template.csv",  "Bulk Tool 2 Template (update_product_item)"),
         ]
-        if n_broken > 0:
-            files.append(
-                (p3, "broken_image_urls.csv", f"Broken / Placeholder URLs ({n_broken:,} rows)")
+
+        if broken_count > 0:
+            p3 = os.path.join(td, "broken_image_urls.csv")
+            broken_csv = pd.DataFrame({
+                "businessId": dropped_df["business_id"],
+                "itemMerchantSuppliedId": dropped_df["msid"],
+                "URL": dropped_df["image_url"],
+            })
+            broken_csv.to_csv(p3, index=False)
+            files_to_upload.append(
+                (p3, "broken_image_urls.csv", "Broken / placeholder URLs excluded from upload")
             )
 
-        post_slack_alert(message, files=files)
-
+        post_slack_alert(message, files=files_to_upload)
     print("✅ Slack message posted")
+
 
 if __name__ == "__main__":
     try:
