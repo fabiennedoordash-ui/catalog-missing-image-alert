@@ -61,13 +61,13 @@ BULK_TOOL_2_URL = "https://unity.doordash.com/suites/bulk/bulk_tools/categories/
 # If matched-row count exceeds this, the HEAD-probe step is SKIPPED and only the
 # pattern filter runs. Probing 1M+ URLs would take hours; for backfills we accept
 # that some links will fail in the bulk tool itself.
-HEAD_PROBE_MAX_ROWS = 300_000
+HEAD_PROBE_MAX_ROWS = 10_000_000
 
 # Number of concurrent HEAD requests
-HEAD_PROBE_CONCURRENCY = 50
+HEAD_PROBE_CONCURRENCY = 300
 
 # Per-request timeout in seconds for HEAD probe
-HEAD_PROBE_TIMEOUT = 8
+HEAD_PROBE_TIMEOUT = 15
 
 # Substring patterns (case-insensitive) that mark a URL as a known placeholder.
 # Add new ones here when you spot them in bulk-tool failure reports.
@@ -99,7 +99,7 @@ def trigger_mode_run(report_token: str) -> str:
     return resp.json()["token"]
 
 
-def wait_for_run(report_token: str, run_token: str, max_wait_minutes: int = 25) -> None:
+def wait_for_run(report_token: str, run_token: str, max_wait_minutes: int = 45) -> None:
     url = f"https://app.mode.com/api/{MODE_WORKSPACE}/reports/{report_token}/runs/{run_token}"
     deadline = time.time() + (max_wait_minutes * 60)
     while time.time() < deadline:
