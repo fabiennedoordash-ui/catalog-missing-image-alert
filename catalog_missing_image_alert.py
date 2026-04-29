@@ -5,17 +5,17 @@ NV Catalog Missing-Image Alert
 Runs daily at ~1 PM EST.
 
 Flow:
-1. Pulls MSIDs currently missing images across all NV US merchants
-   (excl. Restaurant & Drive) from merchant_catalog via Mode (Snowflake).
-2. Pulls BSKU items that have image URLs for the same set via Mode (Trino).
-3. Joins to find which missing-image MSIDs have a URL available in BSKU.
-4. Filters out broken/placeholder URLs:
+1. Runs a single merged Trino query in Mode that joins:
+     - MSIDs currently missing images in merchant_catalog_snapshot
+     - BSKU rows where the merchant has sent an image URL in the last 2 days
+   The query returns rows that satisfy both conditions (already joined).
+2. Filters out broken/placeholder URLs:
      a. Pattern filter: drops known placeholder patterns (DD_PLACEHOLDER, ItemDefault,
-        coming-soon, etc.) and Modisoft hash URLs that 404 reliably.
+        coming-soon, CVS weekly-ad, Modisoft hash URLs, etc.)
      b. HEAD probe: hits each remaining URL with a HEAD request to confirm it's
         actually live (200 OK). Skipped automatically when row count is high
         (one-time backfills) to keep runtime sane.
-5. Posts a summary + two CSVs to #nv-catalog-missingimage-alert.
+3. Posts a summary + CSVs to #nv-catalog-missingimage-alert.
 """
 
 import os
@@ -40,7 +40,6 @@ MODE_SECRET = os.environ["MODE_SECRET"]
 AUTH = (MODE_TOKEN, MODE_SECRET)
 
 MISSING_IMAGE_REPORT_TOKEN = os.environ["MISSING_IMAGE_REPORT_TOKEN"]
-BSKU_URLS_REPORT_TOKEN = os.environ["BSKU_URLS_REPORT_TOKEN"]
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL = "C0AUXV98TD1"  # #nv-catalog-missingimage-alert
@@ -240,37 +239,22 @@ def post_slack_alert(message: str, files: list) -> None:
 # ============================= MAIN ===============================
 
 def main():
-    # --- 1) Pull missing-image MSIDs (Snowflake) ---
-    missing = run_mode_report(MISSING_IMAGE_REPORT_TOKEN, "Query 1 — missing images")
-    missing.columns = [c.lower() for c in missing.columns]
-    missing["business_id"] = missing["business_id"].astype(str)
-    missing["msid"] = missing["msid"].astype(str)
-
-    # --- 2) Pull BSKU items with URLs (Trino) ---
-    bsku = run_mode_report(BSKU_URLS_REPORT_TOKEN, "Query 2 — BSKU URLs")
-    bsku.columns = [c.lower() for c in bsku.columns]
-    bsku["business_id"] = bsku["business_id"].astype(str)
-    bsku["msid"] = bsku["msid"].astype(str)
-
-    if "updated_at" in bsku.columns:
-        bsku = (
-            bsku.sort_values("updated_at")
-                .drop_duplicates(subset=["business_id", "msid"], keep="last")
-        )
-
-    # Filter out NaN, empty, and non-http placeholder values (cheap pre-filter)
-    bsku = bsku[bsku["image_url"].notna()]
-    bsku["image_url"] = bsku["image_url"].str.strip()
-    bsku = bsku[bsku["image_url"] != ""]
-    bsku = bsku[bsku["image_url"].str.startswith(("http://", "https://"))]
-
-    # --- 3) Inner join ---
-    matched = missing.merge(
-        bsku[["business_id", "msid", "image_url"]],
-        on=["business_id", "msid"],
-        how="inner",
+    # --- 1) Pull merged result (Trino, single query) ---
+    matched = run_mode_report(
+        MISSING_IMAGE_REPORT_TOKEN,
+        "Merged missing-image + BSKU URL query"
     )
-    print(f"\n✅ Matched {len(matched):,} MSIDs with URLs available in BSKU")
+    matched.columns = [c.lower() for c in matched.columns]
+    matched["business_id"] = matched["business_id"].astype(str)
+    matched["msid"] = matched["msid"].astype(str)
+
+    # Defensive cleanup on URL column (query already filters to http%, but belt-and-suspenders)
+    matched = matched[matched["image_url"].notna()]
+    matched["image_url"] = matched["image_url"].str.strip()
+    matched = matched[matched["image_url"] != ""]
+    matched = matched[matched["image_url"].str.startswith(("http://", "https://"))]
+
+    print(f"\n✅ {len(matched):,} MSIDs missing images with a usable BSKU URL")
 
     if matched.empty:
         print("Nothing to alert on — exiting quietly.")
@@ -313,9 +297,9 @@ def main():
         "photoID": "",
     })
 
-    # --- 6) Per-merchant breakdown (dynamic from business_name) ---
+    # --- 6) Per-merchant breakdown (business_name comes from the merged query) ---
     name_lookup = (
-        missing[["business_id", "business_name"]]
+        matched[["business_id", "business_name"]]
         .dropna(subset=["business_name"])
         .drop_duplicates(subset=["business_id"])
         .set_index("business_id")["business_name"]
@@ -323,7 +307,6 @@ def main():
     )
 
     counts_matched = matched.groupby("business_id").size().sort_values(ascending=False)
-    counts_missing = missing.groupby("business_id").size()
 
     today = datetime.now(ZoneInfo("America/New_York")).strftime("%b %d, %Y")
     total_matched = len(matched)
